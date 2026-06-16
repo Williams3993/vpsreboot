@@ -11,7 +11,7 @@ NC='\033[0m' # No Color
 REBOOT_HOUR=14
 
 echo "=================================="
-echo "定时重启设置脚本（保留VPS当地时区）"
+echo "定时重启脚本(按IP所在地自动校正时区)"
 echo "=================================="
 
 # 检查是否为root用户
@@ -46,25 +46,26 @@ get_ipv6() {
     echo ""
 }
 
-# 查询IP归属地(国家 省/区 城市),返回中文
-geo_lookup() {
-    local target="$1" json
-    [ -z "$target" ] && { echo ""; return; }
+# 查询IP归属地+时区,结果写入全局变量 GEO_STR / GEO_TZ
+GEO_STR=""
+GEO_TZ=""
+fetch_geo() {
+    local target="$1" json country region city
+    [ -z "$target" ] && return
     for base in "http://ip-api.com/json" "https://ip-api.com/json"; do
-        json=$(curl -s --max-time 6 "${base}/${target}?lang=zh-CN&fields=status,country,regionName,city" 2>/dev/null)
+        json=$(curl -s --max-time 6 "${base}/${target}?lang=zh-CN&fields=status,country,regionName,city,timezone" 2>/dev/null)
         if echo "$json" | grep -q '"status":"success"'; then
-            local country region city
             country=$(echo "$json" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')
             region=$(echo "$json" | sed -n 's/.*"regionName":"\([^"]*\)".*/\1/p')
             city=$(echo "$json" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')
-            echo "$(echo "$country $region $city" | sed 's/  */ /g; s/^ *//; s/ *$//')"
+            GEO_TZ=$(echo "$json" | sed -n 's/.*"timezone":"\([^"]*\)".*/\1/p')
+            GEO_STR=$(echo "$country $region $city" | sed 's/  */ /g; s/^ *//; s/ *$//')
             return 0
         fi
     done
-    echo ""
 }
 
-echo -e "${YELLOW}[1/5] 检测系统类型...${NC}"
+echo -e "${YELLOW}[1/6] 检测系统类型...${NC}"
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     echo -e "${GREEN}系统: $PRETTY_NAME${NC}"
@@ -72,30 +73,52 @@ else
     echo -e "${YELLOW}无法检测系统类型,继续执行...${NC}"
 fi
 
-# 不修改时区，仅读取VPS当前所在时区
-echo -e "\n${YELLOW}[2/5] 读取VPS当前时区(不做修改)...${NC}"
+# 读取当前系统时区
+echo -e "\n${YELLOW}[2/6] 读取当前系统时区...${NC}"
 if command -v timedatectl &> /dev/null; then
     CURRENT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null)
 fi
 [ -z "$CURRENT_TZ" ] && CURRENT_TZ=$(cat /etc/timezone 2>/dev/null)
 [ -z "$CURRENT_TZ" ] && CURRENT_TZ=$(readlink -f /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')
 [ -z "$CURRENT_TZ" ] && CURRENT_TZ="未知"
-echo -e "${GREEN}✓ 已读取当前时区: ${CURRENT_TZ}${NC}"
+echo -e "${GREEN}✓ 当前系统时区: ${CURRENT_TZ}${NC}"
 
-# 探测公网IP与归属地
-echo -e "\n${YELLOW}[3/5] 探测公网IP与归属地(需要联网,稍候)...${NC}"
+# 探测公网IP与归属地(含时区)
+echo -e "\n${YELLOW}[3/6] 探测公网IP与归属地(需要联网,稍候)...${NC}"
 IPV4=$(get_ipv4)
 IPV6=$(get_ipv6)
-GEO=$(geo_lookup "${IPV4:-$IPV6}")
-[ -z "$IPV4" ] && IPV4="无 / 未检测到"
-[ -z "$IPV6" ] && IPV6="无 / 未检测到"
-[ -z "$GEO" ]  && GEO="查询失败(可能无外网或API限流)"
-echo -e "${GREEN}✓ IPv4: ${IPV4}${NC}"
-echo -e "${GREEN}✓ IPv6: ${IPV6}${NC}"
-echo -e "${GREEN}✓ 归属: ${GEO}${NC}"
+fetch_geo "${IPV4:-$IPV6}"   # 以IPv4为准查询,无IPv4则用IPv6
+[ -z "$IPV4" ] && IPV4_SHOW="无 / 未检测到" || IPV4_SHOW="$IPV4"
+[ -z "$IPV6" ] && IPV6_SHOW="无 / 未检测到" || IPV6_SHOW="$IPV6"
+[ -z "$GEO_STR" ] && GEO_SHOW="查询失败(可能无外网或API限流)" || GEO_SHOW="$GEO_STR"
+echo -e "${GREEN}✓ IPv4: ${IPV4_SHOW}${NC}"
+echo -e "${GREEN}✓ IPv6: ${IPV6_SHOW}${NC}"
+echo -e "${GREEN}✓ 归属: ${GEO_SHOW}${NC}"
+echo -e "${GREEN}✓ IP所在地时区: ${GEO_TZ:-未知}${NC}"
 
-# 配置定时重启（每天当地时间 REBOOT_HOUR 点）
-echo -e "\n${YELLOW}[4/5] 配置每天 ${REBOOT_HOUR}:00 (VPS当地时间) 定时重启...${NC}"
+# 核心:按IP所在地时区校正系统时区(解决DD后默认上海时间的问题)
+echo -e "\n${YELLOW}[4/6] 按IP所在地校正系统时区...${NC}"
+TZ_FIXED="否"
+if [ -z "$GEO_TZ" ]; then
+    echo -e "${YELLOW}! 未能获取IP所在地时区(可能无外网),跳过校正,保持当前时区 ${CURRENT_TZ}${NC}"
+elif [ ! -f "/usr/share/zoneinfo/$GEO_TZ" ]; then
+    echo -e "${YELLOW}! 系统无该时区数据文件($GEO_TZ),跳过校正,保持当前时区 ${CURRENT_TZ}${NC}"
+elif [ "$GEO_TZ" = "$CURRENT_TZ" ]; then
+    echo -e "${GREEN}✓ 系统时区已与IP所在地一致($CURRENT_TZ),无需修改${NC}"
+else
+    echo -e "${YELLOW}检测到不一致: 系统[${CURRENT_TZ}] -> IP所在地[${GEO_TZ}],正在校正...${NC}"
+    if command -v timedatectl &> /dev/null; then
+        timedatectl set-timezone "$GEO_TZ" 2>/dev/null
+    fi
+    ln -sf "/usr/share/zoneinfo/$GEO_TZ" /etc/localtime
+    echo "$GEO_TZ" > /etc/timezone
+    CURRENT_TZ="$GEO_TZ"
+    TZ_FIXED="是"
+    echo -e "${GREEN}✓ 已将系统时区校正为: ${GEO_TZ}${NC}"
+fi
+
+# 配置定时重启(每天当地时间 REBOOT_HOUR 点)
+echo -e "\n${YELLOW}[5/6] 配置每天 ${REBOOT_HOUR}:00 (当地时间) 定时重启...${NC}"
 crontab -l > /tmp/current_cron 2>/dev/null || touch /tmp/current_cron
 if grep -q "reboot" /tmp/current_cron; then
     echo -e "${YELLOW}检测到已存在的重启任务,将进行替换...${NC}"
@@ -104,8 +127,8 @@ fi
 echo "0 ${REBOOT_HOUR} * * * /sbin/reboot" >> /tmp/current_cron
 crontab /tmp/current_cron
 
-# 验证crontab是否设置成功
-echo -e "\n${YELLOW}[5/5] 验证定时任务设置...${NC}"
+# 验证crontab
+echo -e "\n${YELLOW}[6/6] 验证定时任务设置...${NC}"
 if crontab -l | grep -q "0 ${REBOOT_HOUR} \* \* \* /sbin/reboot"; then
     echo -e "${GREEN}✓ 定时重启任务设置成功!${NC}"
 else
@@ -114,8 +137,8 @@ else
     exit 1
 fi
 
-# 确保cron服务正在运行
-echo -e "\n${YELLOW}检查cron服务状态...${NC}"
+# 确保cron服务运行(时区改了后重启cron使其按新时区触发)
+echo -e "\n${YELLOW}检查并重启cron服务(应用新时区)...${NC}"
 if command -v systemctl &> /dev/null; then
     systemctl enable cron 2>/dev/null || systemctl enable crond 2>/dev/null
     systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null
@@ -130,7 +153,7 @@ else
 fi
 rm -f /tmp/current_cron
 
-# 计算下一次重启的具体时刻(按当地时间)
+# 计算下一次重启时刻(按当地时间)
 NOW_HM=$(date '+%H%M')
 TARGET_HM=$(printf '%02d00' "$REBOOT_HOUR")
 if [ "$NOW_HM" -lt "$TARGET_HM" ]; then
@@ -139,13 +162,13 @@ else
     NEXT_REBOOT="$(date -d 'tomorrow' '+%Y-%m-%d') $(printf '%02d:00:00' "$REBOOT_HOUR") (明天)"
 fi
 
-# ========= 醒目信息块(argosbx风格) =========
+# ========= 醒目信息块 =========
 echo ""
 echo -e "${CYAN}=========== 当前服务器与定时重启配置情况 ===========${NC}"
-echo -e "本地IPv4地址 ：${GREEN}${IPV4}${NC}"
-echo -e "本地IPv6地址 ：${GREEN}${IPV6}${NC}"
-echo -e "IP所属地区   ：${GREEN}${GEO}${NC}"
-echo -e "使用时区     ：${GREEN}${CURRENT_TZ}${NC}  ($(date '+%Z %z'))"
+echo -e "本地IPv4地址 ：${GREEN}${IPV4_SHOW}${NC}"
+echo -e "本地IPv6地址 ：${GREEN}${IPV6_SHOW}${NC}"
+echo -e "IP所属地区   ：${GREEN}${GEO_SHOW}${NC}"
+echo -e "使用时区     ：${GREEN}${CURRENT_TZ}${NC}  ($(date '+%Z %z'))   [本次是否校正:${TZ_FIXED}]"
 echo -e "当前系统时间 ：${GREEN}$(date '+%Y-%m-%d %H:%M:%S')${NC}"
 echo -e "每日重启时间 ：${GREEN}$(printf '%02d:00' "$REBOOT_HOUR") (按上面的当地时区)${NC}"
 echo -e "下次重启时刻 ：${GREEN}${NEXT_REBOOT}${NC}"
